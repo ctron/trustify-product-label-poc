@@ -60,8 +60,14 @@ fn main() -> anyhow::Result<()> {
     let collector = Collector {
         extractors: vec![
             Box::new(|ctx: Context, doc: &mut Document| {
-                doc.labels
-                    .insert("path".into(), ctx.path.display().to_string());
+                doc.labels.insert(
+                    "path".into(),
+                    ctx.path
+                        .file_name()
+                        .unwrap_or(ctx.path.as_os_str())
+                        .to_string_lossy()
+                        .to_string(),
+                );
             }),
             Box::new(Label(Cpe(|cpe| {
                 vec![
@@ -127,6 +133,7 @@ struct Context<'a> {
     pub path: &'a Path,
     pub cpes: &'a [Uri<'a>],
     pub describing: &'a [&'a PackageInformation],
+    pub sbom: &'a SPDX,
 }
 
 trait Extractor: Send {
@@ -259,7 +266,9 @@ impl Collector {
         let id = format!(
             "{}#{}",
             sbom.document_creation_information.spdx_document_namespace,
-            path.display()
+            path.file_name()
+                .unwrap_or(path.as_os_str())
+                .to_string_lossy()
         );
 
         let context = Context {
@@ -267,6 +276,7 @@ impl Collector {
             path,
             cpes: &cpes,
             describing: &describing,
+            sbom,
         };
 
         let mut document = Document::default();
