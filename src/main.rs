@@ -1,3 +1,4 @@
+use anyhow::anyhow;
 use bytes::{Bytes, BytesMut};
 use clap::Parser;
 use cpe::component::Component;
@@ -11,14 +12,16 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::fs::File;
 use std::io::stdout;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use walker_common::compression::Compression;
+use walker_common::compression::Detector;
 
 #[derive(Debug, PartialEq, Eq, clap::Parser)]
 struct Cli {
     #[arg()]
     source: PathBuf,
+    #[arg(short, long, default_value = ".json.bz2")]
+    suffix: String,
     #[arg(short, long)]
     output: Option<PathBuf>,
 }
@@ -26,11 +29,25 @@ struct Cli {
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
-    let path = cli.source.display();
-    let path = format!("{path}/*.json.bz2");
-    println!("Scanning: {path}");
+    println!("Scanning: {}", cli.source.display());
 
-    let entries: Vec<PathBuf> = glob::glob(&path)?.collect::<Result<_, _>>()?;
+    let mut entries = vec![];
+
+    for entry in fs::read_dir(&cli.source)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_file() {
+            continue;
+        }
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if !name.ends_with(&cli.suffix) {
+            continue;
+        }
+
+        entries.push(entry.path());
+    }
 
     let pb = ProgressBar::new(entries.len() as u64);
     pb.set_style(
@@ -42,6 +59,10 @@ fn main() -> anyhow::Result<()> {
 
     let collector = Collector {
         extractors: vec![
+            Box::new(|ctx: Context, doc: &mut Document| {
+                doc.labels
+                    .insert("path".into(), ctx.path.display().to_string());
+            }),
             Box::new(Label(Cpe(|cpe| {
                 vec![
                     ("cpe".into(), Some(cpe.to_string())),
@@ -79,12 +100,15 @@ fn main() -> anyhow::Result<()> {
         .progress_with(pb.clone())
         .try_for_each(|entry| {
             let data = Bytes::from(fs::read(entry)?);
-            let mut data: BytesMut = Compression::Bzip2.decompress(data)?.into();
+            let mut data: BytesMut = Detector::default()
+                .decompress(data)
+                .map_err(|err| anyhow!("Decompression failed: {err}"))?
+                .into();
             let sbom: SPDX = simd_json::from_slice(&mut data)?;
 
             pb.println(format!("{}", entry.display()));
 
-            collector.lock().process(&sbom)?;
+            collector.lock().process(entry, &sbom)?;
             Ok::<_, anyhow::Error>(())
         })?;
 
@@ -100,6 +124,7 @@ fn main() -> anyhow::Result<()> {
 #[derive(Copy, Clone)]
 struct Context<'a> {
     pub id: &'a str,
+    pub path: &'a Path,
     pub cpes: &'a [Uri<'a>],
     pub describing: &'a [&'a PackageInformation],
 }
@@ -113,7 +138,7 @@ where
     F: for<'b> Fn(Context, &'b mut Document) + Send,
 {
     fn extract(&self, context: Context, document: &mut Document) {
-        (self)(context, document)
+        self(context, document)
     }
 }
 
@@ -126,7 +151,7 @@ where
     F: for<'a> Fn(&'a mut Document) + Send,
 {
     fn extract(&self, _context: Context, document: &mut Document) {
-        (self.0)(document)
+        self.0(document)
     }
 }
 
@@ -147,7 +172,7 @@ where
     F: Fn(Context) -> Vec<(String, Option<String>)> + Send,
 {
     fn extract_label(&self, context: Context) -> Vec<(String, Option<String>)> {
-        (self)(context)
+        self(context)
     }
 }
 
@@ -158,7 +183,7 @@ where
     fn extract_label(&self, context: Context) -> Vec<(String, Option<String>)> {
         let mut result = Vec::new();
         for cpe in context.cpes {
-            result.extend((self.0)(cpe))
+            result.extend(self.0(cpe))
         }
         result
     }
@@ -171,7 +196,7 @@ where
     fn extract_label(&self, context: Context) -> Vec<(String, Option<String>)> {
         let mut result = Vec::new();
         for package in context.describing {
-            result.extend((self.0)(package))
+            result.extend(self.0(package))
         }
         result
     }
@@ -210,6 +235,7 @@ struct Collector {
 
 #[derive(Default)]
 struct Data {
+    pub files: usize,
     pub documents: BTreeMap<String, Document>,
 }
 
@@ -219,7 +245,9 @@ struct Document {
 }
 
 impl Collector {
-    pub fn process(&mut self, sbom: &SPDX) -> anyhow::Result<()> {
+    pub fn process(&mut self, path: &Path, sbom: &SPDX) -> anyhow::Result<()> {
+        self.data.files += 1;
+
         let cpes = find_cpes(sbom);
         let cpes = cpes
             .iter()
@@ -228,10 +256,15 @@ impl Collector {
 
         let describing = find_describing(sbom);
 
-        let id = &sbom.document_creation_information.spdx_document_namespace;
+        let id = format!(
+            "{}#{}",
+            sbom.document_creation_information.spdx_document_namespace,
+            path.display()
+        );
 
         let context = Context {
-            id,
+            id: &id,
+            path,
             cpes: &cpes,
             describing: &describing,
         };
@@ -240,7 +273,7 @@ impl Collector {
         for extractor in &self.extractors {
             extractor.extract(context, &mut document);
         }
-        self.data.documents.insert(id.to_string(), document);
+        self.data.documents.insert(id, document);
 
         Ok(())
     }
@@ -255,6 +288,9 @@ impl Collector {
 
         let groups = &["product", "major", "version", "release"];
         dump_grouped(out, groups, &self.data.documents)?;
+
+        writeln!(out, "{} files", self.data.files)?;
+        writeln!(out, "{} documents", self.data.documents.len())?;
 
         Ok(())
     }
